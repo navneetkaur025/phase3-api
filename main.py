@@ -65,7 +65,7 @@ def completed_courses(history):
             )
 
     return completed
-    return code.upper().replace(" ", "").replace("-", "")
+   
 
 @app.get("/")
 def home():
