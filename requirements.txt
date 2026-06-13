@@ -3,3 +3,5 @@ uvicorn
 beautifulsoup4
 python-multipart
 pydantic
+bcrypt
+PyJWT

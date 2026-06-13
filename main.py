@@ -1,12 +1,31 @@
+import bcrypt
+import jwt
+import time
+
+from fastapi import Header
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel
+from collections import defaultdict
 from bs4 import BeautifulSoup
 
 app = FastAPI()
 
 students = {}
+users = {}
 
+SECRET_KEY = "phase4-secret-key"
+
+admin_hash = bcrypt.hashpw(
+    b"admin",
+    bcrypt.gensalt()
+)
+
+users["admin"] = {
+    "password": admin_hash,
+    "role": "admin"
+}
 catalog = {}
+rate_limits = defaultdict(list)
 class HistoryRecord(BaseModel):
     course_code: str
     term: str
@@ -25,6 +44,76 @@ class PlannedCourse(BaseModel):
 
 class PlanRequest(BaseModel):
     planned_courses: list[PlannedCourse]
+
+
+class RegisterRequest(BaseModel):
+    username: str
+    password: str
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+def create_token(username, role):
+
+    payload = {
+        "sub": username,
+        "role": role,
+        "iat": int(time.time())
+    }
+
+    return jwt.encode(
+        payload,
+        SECRET_KEY,
+        algorithm="HS256"
+    )
+def rate_limit(key):
+
+    now = time.time()
+
+    rate_limits[key] = [
+        t for t in rate_limits[key]
+        if now - t < 60
+    ]
+
+    if len(rate_limits[key]) >= 10:
+        raise HTTPException(
+            status_code=429,
+            detail="Too Many Requests"
+        )
+
+    rate_limits[key].append(now)
+
+def get_current_user(authorization):
+
+    print("AUTH HEADER =", authorization)
+
+    if not authorization:
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized"
+        )
+
+    try:
+
+        token = authorization.replace(
+            "Bearer ",
+            ""
+        )
+
+        payload = jwt.decode(
+            token,
+            SECRET_KEY,
+            algorithms=["HS256"]
+        )
+
+        return payload
+
+    except:
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized"
+        )
 def normalize_course_code(code):
     return code.upper().replace(" ", "").replace("-", "")
 
@@ -67,14 +156,85 @@ def completed_courses(history):
     return completed
    
 
+@app.post("/api/v1/auth/register", status_code=201)
+def register(data: RegisterRequest):
+
+    if data.username in users:
+
+        raise HTTPException(
+            status_code=409,
+            detail="User already exists"
+        )
+
+    password_hash = bcrypt.hashpw(
+        data.password.encode(),
+        bcrypt.gensalt()
+    )
+
+    users[data.username] = {
+        "password": password_hash,
+        "role": "student"
+    }
+
+    students[data.username] = {
+        "history": [],
+        "plan": []
+    }
+
+    return {
+        "status": "registered"
+    }
+
+
+@app.post("/api/v1/auth/login")
+def login(data: LoginRequest):
+
+    if data.username not in users:
+
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid credentials"
+        )
+
+    user = users[data.username]
+
+    if not bcrypt.checkpw(
+        data.password.encode(),
+        user["password"]
+    ):
+
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid credentials"
+        )
+
+    token = create_token(
+        data.username,
+        user["role"]
+    )
+
+    return {
+        "access_token": token,
+        "token_type": "bearer"
+    }
 @app.get("/")
 def home():
     return {"message": "API Working"}
 
 
 @app.post("/api/v1/students/{student_id}/history/import", status_code=201)
-async def import_history(student_id: str, file: UploadFile = File(...)):
+async def import_history(
+    student_id: str,
+    file: UploadFile = File(...),
+    authorization: str = Header(None)
+):
+    user = get_current_user(authorization)
 
+    if user["sub"] != student_id:
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized"
+        )
     content = await file.read()
     soup = BeautifulSoup(content, "html.parser")
 
@@ -164,10 +324,28 @@ def delete_history(student_id: str):
 
 
 @app.post("/api/v1/students/{student_id}/plan")
-def save_plan(student_id: str, data: PlanRequest):
+def save_plan(
+    student_id: str,
+    data: PlanRequest,
+    authorization: str = Header(None)
+):
+
+    user = get_current_user(authorization)
+
+    if (
+        user["sub"] != student_id
+        and user["role"] != "admin"
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized"
+        )
 
     if student_id not in students:
-        raise HTTPException(status_code=404, detail="Student not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Student not found"
+        )
 
     students[student_id]["plan"] = [
         item.model_dump() for item in data.planned_courses
@@ -180,10 +358,28 @@ def save_plan(student_id: str, data: PlanRequest):
 
 
 @app.put("/api/v1/students/{student_id}/plan")
-def replace_plan(student_id: str, data: PlanRequest):
+def replace_plan(
+    student_id: str,
+    data: PlanRequest,
+    authorization: str = Header(None)
+):
+
+    user = get_current_user(authorization)
+
+    if (
+        user["sub"] != student_id
+        and user["role"] != "admin"
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized"
+        )
 
     if student_id not in students:
-        raise HTTPException(status_code=404, detail="Student not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Student not found"
+        )
 
     students[student_id]["plan"] = [
         item.model_dump() for item in data.planned_courses
@@ -194,16 +390,34 @@ def replace_plan(student_id: str, data: PlanRequest):
         "planned_courses_saved": len(data.planned_courses)
     }
 
-
 @app.delete("/api/v1/students/{student_id}/plan")
-def delete_plan(student_id: str):
+def delete_plan(
+    student_id: str,
+    authorization: str = Header(None)
+):
+
+    user = get_current_user(authorization)
+
+    if (
+        user["sub"] != student_id
+        and user["role"] != "admin"
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized"
+        )
 
     if student_id not in students:
-        raise HTTPException(status_code=404, detail="Student not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Student not found"
+        )
 
     students[student_id]["plan"] = []
 
-    return {"status": "success"}
+    return {
+        "status": "success"
+    }
 
 @app.post("/api/v1/admin/catalog/import")
 async def import_catalog(file: UploadFile = File(...)):
@@ -270,8 +484,14 @@ def get_course(course_code: str):
 
 
 @app.get("/api/v1/students/{student_id}/audit-report")
-def audit_report(student_id: str, strict: bool = False):
+def audit_report(
+    student_id: str,
+    strict: bool = False,
+    authorization: str = Header(None)
+):
+    user = get_current_user(authorization)
 
+    rate_limit(user["sub"])
     if student_id not in students:
         raise HTTPException(
             status_code=404,
@@ -375,13 +595,83 @@ def audit_report(student_id: str, strict: bool = False):
         }
     }
 @app.get("/api/v1/students/{student_id}/profile")
-def get_profile(student_id: str):
+def get_profile(
+    student_id: str,
+    authorization: str = Header(None)
+):
+
+    user = get_current_user(authorization)
+
+    if (
+        user["sub"] != student_id
+        and user["role"] != "admin"
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized"
+        )
 
     if student_id not in students:
-        raise HTTPException(status_code=404, detail="Student not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Student not found"
+        )
 
     return {
         "student_id": student_id,
         "history": students[student_id]["history"],
         "plan": students[student_id]["plan"]
+    }
+@app.get("/api/v1/students/{student_id}/recommendations")
+def recommendations(
+    student_id: str,
+    authorization: str = Header(None)
+):
+
+    user = get_current_user(authorization)
+
+    if (
+        user["sub"] != student_id
+        and user["role"] != "admin"
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized"
+        )
+
+    if student_id not in students:
+        raise HTTPException(
+            status_code=404,
+            detail="Student not found"
+        )
+
+    completed = completed_courses(
+        students[student_id]["history"]
+    )
+
+    pathway = []
+
+    term_number = 0
+
+    for code, course in catalog.items():
+
+        if code in completed:
+            continue
+
+        year = 26 + (term_number // 3)
+
+        seasons = ["F", "W", "S"]
+
+        term = f"{year}{seasons[term_number % 3]}"
+
+        pathway.append({
+            "term": term,
+            "courses": [course["course_code"]]
+        })
+
+        term_number += 1
+
+    return {
+        "student_id": student_id,
+        "recommended_pathway": pathway
     }
